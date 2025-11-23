@@ -1,4 +1,4 @@
-# app.py - Extrator de NF-e Seguro e Dinâmico
+# app.py
 import streamlit as st
 import pandas as pd
 import re
@@ -7,103 +7,41 @@ import sqlite3
 import xml.etree.ElementTree as ET
 import pdfplumber
 from datetime import datetime
-import hashlib
+from cryptography.fernet import Fernet
+import base64
+import os
 
-# ===========================
-# Configuração da página
-# ===========================
-st.set_page_config(page_title="Extrator de NF-e", layout="wide")
+# ------------------------------
+# Configuração Streamlit
+# ------------------------------
+st.set_page_config(page_title="Extrator de NF-e Seguro", layout="wide")
 
-# ===========================
-# Banco de dados local
-# ===========================
-DB_PATH = "nfe_local.db"  # caminho do banco SQLite
+DB_PATH = "nfe_local_encrypted.db"
+MAX_LOGIN_ATTEMPTS = 5
+AES_KEY_FILE = "aes_key.key"
 
-def criar_banco_local(path=DB_PATH):
-    """Cria o banco SQLite com tabela de notas e tabela de usuários."""
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-    # tabela de notas
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS notas (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        arquivo TEXT,
-        chave_acesso TEXT UNIQUE,
-        data TEXT,
-        valor TEXT,
-        peso TEXT,
-        cep_origem TEXT,
-        cep_destino TEXT,
-        nNF TEXT,
-        docnun TEXT,
-        placas TEXT,
-        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    # tabela de usuários
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS usuarios (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        tentativas INTEGER DEFAULT 0,
-        bloqueado INTEGER DEFAULT 0
-    )
-    """)
-    conn.commit()
-    conn.close()
+# ------------------------------
+# Funções de criptografia AES
+# ------------------------------
+def gerar_chave_aes(senha: str):
+    key = base64.urlsafe_b64encode(senha.encode("utf-8").ljust(32)[:32])
+    return Fernet(key)
 
-def hash_senha(senha):
-    """Gera hash SHA256 da senha."""
-    return hashlib.sha256(senha.encode()).hexdigest()
+def salvar_chave_local(key: bytes):
+    with open(AES_KEY_FILE, "wb") as f:
+        f.write(key)
 
-def cadastrar_usuario(username, senha):
-    """Cadastra novo usuário com senha hash."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO usuarios (username, password_hash) VALUES (?,?)",
-                       (username, hash_senha(senha)))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass  # usuário já existe
-    conn.close()
+def carregar_chave_local():
+    if os.path.exists(AES_KEY_FILE):
+        return open(AES_KEY_FILE, "rb").read()
+    return None
 
-def verificar_login(username, senha):
-    """Verifica login, bloqueio e incrementa tentativas."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT password_hash, tentativas, bloqueado FROM usuarios WHERE username=?", (username,))
-    row = cursor.fetchone()
-    if row is None:
-        conn.close()
-        return False, "Usuário não encontrado"
-    senha_hash, tentativas, bloqueado = row
-    if bloqueado:
-        conn.close()
-        return False, "Conta bloqueada"
-    if hash_senha(senha) == senha_hash:
-        # reset tentativas
-        cursor.execute("UPDATE usuarios SET tentativas=0 WHERE username=?", (username,))
-        conn.commit()
-        conn.close()
-        return True, "Login OK"
-    else:
-        tentativas += 1
-        bloqueado_flag = 1 if tentativas >= 5 else 0
-        cursor.execute("UPDATE usuarios SET tentativas=?, bloqueado=? WHERE username=?", (tentativas, bloqueado_flag, username))
-        conn.commit()
-        conn.close()
-        if bloqueado_flag:
-            return False, "Conta bloqueada após 5 tentativas"
-        else:
-            return False, f"Senha incorreta ({tentativas}/5)"
-
-# ===========================
-# Funções de extração
-# ===========================
+# ------------------------------
+# Funções de extração e formatação
+# ------------------------------
 def limpar_chave(texto):
-    if not texto: return ""
+    if not texto:
+        return ""
     s = re.sub(r"\D", "", texto)
     return s if len(s) == 44 else ""
 
@@ -116,20 +54,25 @@ def formatar_valor_br(valor):
         return "" if pd.isna(valor) else str(valor)
 
 def localizar_placas(texto):
-    if not texto: return ""
+    if not texto:
+        return ""
     t = texto.upper()
     pat = r"[A-Z]{3}[0-9]{4}|[A-Z]{3}[0-9][A-Z][0-9]{2}"
     achados = re.findall(pat, t)
-    seen = set(); placas = []
+    seen = set()
+    placas = []
     for p in achados:
-        if p not in seen: seen.add(p); placas.append(p)
+        if p not in seen:
+            seen.add(p)
+            placas.append(p)
     return ", ".join(placas)
 
 def extrair_texto_pdf_bytes(bts):
     text = ""
     try:
         with pdfplumber.open(io.BytesIO(bts)) as pdf:
-            for p in pdf.pages: text += "\n" + (p.extract_text() or "")
+            for p in pdf.pages:
+                text += "\n" + (p.extract_text() or "")
     except:
         try:
             text = bts.decode("latin-1", errors="ignore")
@@ -137,185 +80,279 @@ def extrair_texto_pdf_bytes(bts):
             text = ""
     return text
 
+# ------------------------------
+# Extração XML/PDF
+# ------------------------------
 def extract_from_xml_bytes(bts):
     try:
         root = ET.fromstring(bts)
     except:
         return {"error": "XML inválido"}
+
     texto = ET.tostring(root, encoding="utf-8", method="text").decode("utf-8")
-    # Chave
+    # Chave de acesso
     chave = ""
     for elem in root.iter():
-        if elem.tag.lower().endswith("infnfe") and "Id" in elem.attrib:
-            chave = limpar_chave(elem.attrib.get("Id",""))
-            if chave: break
+        tag = elem.tag
+        if tag.lower().endswith("infnfe") and "Id" in elem.attrib:
+            chave = limpar_chave(elem.attrib.get("Id", ""))
+            if chave:
+                break
     if not chave:
         m = re.search(r"\d{44}", texto)
-        if m: chave = limpar_chave(m.group(0))
+        if m:
+            chave = limpar_chave(m.group(0))
     # Data
     data = ""
-    m = re.search(r"\d{4}-\d{2}-\d{2}", texto) or re.search(r"\d{2}/\d{2}/\d{4}", texto)
+    m = re.search(r"\d{4}-\d{2}-\d{2}", texto)
     if m:
-        try:
-            if "/" in m.group(0):
-                data = datetime.strptime(m.group(0), "%d/%m/%Y").date().isoformat()
-            else:
-                data = m.group(0)
-        except:
-            data = m.group(0)
+        data = m.group(0)
+    else:
+        m2 = re.search(r"\d{2}/\d{2}/\d{4}", texto)
+        if m2:
+            try:
+                data = datetime.strptime(m2.group(0), "%d/%m/%Y").date().isoformat()
+            except:
+                data = m2.group(0)
     # Valor
     v = ""
-    m = re.search(r"vNF[^0-9]*([\d\.,]+)", texto, flags=re.IGNORECASE) or re.search(r"R\$[^\d]*([\d\.,]+)", texto)
-    if m: v = formatar_valor_br(m.group(1))
+    m = re.search(r"vNF[^0-9]*([\d\.,]+)", texto, flags=re.IGNORECASE)
+    if m:
+        v = formatar_valor_br(m.group(1))
+    else:
+        m2 = re.search(r"R\$[^\d]*([\d\.,]+)", texto)
+        if m2:
+            v = formatar_valor_br(m2.group(1))
     # Peso
     p = ""
-    m = re.search(r"(peso[^\d]*)([\d\.,]+)", texto, flags=re.IGNORECASE) or re.search(r"([\d\.,]+)\s?kg", texto, flags=re.IGNORECASE)
-    if m: p = formatar_valor_br(m.group(2) if len(m.groups())>1 else m.group(1))
+    m = re.search(r"(peso[^\d]*)([\d\.,]+)", texto, flags=re.IGNORECASE)
+    if m:
+        p = formatar_valor_br(m.group(2))
+    else:
+        m2 = re.search(r"([\d\.,]+)\s?kg", texto, flags=re.IGNORECASE)
+        if m2:
+            p = formatar_valor_br(m2.group(1))
     # CEPs
     ceps = re.findall(r"\d{5}-\d{3}|\d{8}", texto)
-    cep_orig = ceps[0] if len(ceps)>0 else ""
-    cep_dest = ceps[1] if len(ceps)>1 else ""
-    # nNF
-    nNF = re.search(r"\bnNF\b[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    nNF = nNF.group(1) if nNF else ""
-    # docnun
-    docnun = re.search(r"docnun[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    docnun = docnun.group(1) if docnun else ""
+    cep_origem = ceps[0] if len(ceps) > 0 else ""
+    cep_destino = ceps[1] if len(ceps) > 1 else ""
+    # Municípios
+    muns = re.findall(r"(?:Município|xMun)[^\w]*([\w\s]+)", texto)
+    municipio_origem = muns[0] if len(muns) > 0 else ""
+    municipio_destino = muns[1] if len(muns) > 1 else ""
+    # Número NF
+    nNF = ""
+    m = re.search(r"\bnNF\b[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
+    if m:
+        nNF = m.group(1)
+    # Docnun
+    docnun = ""
+    m = re.search(r"docnun[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
+    if m:
+        docnun = m.group(1)
+    # Placas
     placas = localizar_placas(texto)
-    return {"arquivo":"","chave_acesso":chave,"data":data,"valor":v,"peso":p,"cep_origem":cep_orig,"cep_destino":cep_dest,"nNF":nNF,"docnun":docnun,"placas":placas}
+
+    return {
+        "arquivo": "",
+        "chave_acesso": chave,
+        "data": data,
+        "valor": v,
+        "peso": p,
+        "cep_origem": cep_origem,
+        "cep_destino": cep_destino,
+        "municipio_origem": municipio_origem,
+        "municipio_destino": municipio_destino,
+        "nNF": nNF,
+        "docnun": docnun,
+        "placas": placas
+    }
 
 def extract_from_pdf_bytes(bts):
     texto = extrair_texto_pdf_bytes(bts)
-    # Chave
-    chave = re.search(r"\d{44}", texto)
-    chave = limpar_chave(chave.group(0)) if chave else ""
-    # Data
-    data = re.search(r"\d{2}/\d{2}/\d{4}", texto)
-    data = datetime.strptime(data.group(0), "%d/%m/%Y").date().isoformat() if data else ""
-    # Valor
-    v = re.search(r"R\$[^\d]*([\d\.,]+)", texto)
-    v = formatar_valor_br(v.group(1)) if v else ""
-    # Peso
-    p = re.search(r"([\d\.,]+)\s?kg", texto, flags=re.IGNORECASE) or re.search(r"peso[^\d]*([\d\.,]+)", texto, flags=re.IGNORECASE)
-    p = formatar_valor_br(p.group(1)) if p else ""
-    # CEPs
-    ceps = re.findall(r"\d{5}-\d{3}|\d{8}", texto)
-    cep_orig = ceps[0] if len(ceps)>0 else ""
-    cep_dest = ceps[1] if len(ceps)>1 else ""
-    # nNF
-    nNF = re.search(r"\bnNF\b[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    nNF = nNF.group(1) if nNF else ""
-    # docnun
-    docnun = re.search(r"docnun[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    docnun = docnun.group(1) if docnun else ""
-    placas = localizar_placas(texto)
-    return {"arquivo":"","chave_acesso":chave,"data":data,"valor":v,"peso":p,"cep_origem":cep_orig,"cep_destino":cep_dest,"nNF":nNF,"docnun":docnun,"placas":placas}
+    # Reaproveitar função XML para estrutura
+    return extract_from_xml_bytes(texto.encode('utf-8'))
 
+# ------------------------------
+# Processamento múltiplos arquivos
+# ------------------------------
 def processar_arquivos(files):
-    """Processa múltiplos arquivos e retorna dataframe"""
     rows = []
     for nome, conteudo in files:
         ext = nome.lower().split('.')[-1]
-        if ext=="xml":
+        if ext == "xml":
             info = extract_from_xml_bytes(conteudo)
-        elif ext=="pdf":
+        elif ext == "pdf":
             info = extract_from_pdf_bytes(conteudo)
         else:
             try:
-                txt = conteudo.decode("latin-1", errors="ignore")
-                info = {"arquivo":nome,"chave_acesso":limpar_chave(re.search(r"\d{44}", txt).group(0)) if re.search(r"\d{44}", txt) else "", "data":"","valor":"","peso":"","cep_origem":"","cep_destino":"","nNF":"","docnun":"","placas":localizar_placas(txt)}
+                txt = conteudo.decode('latin-1', errors='ignore')
+                info = {
+                    "arquivo": nome,
+                    "chave_acesso": limpar_chave(re.search(r"\d{44}", txt).group(0)) if re.search(r"\d{44}", txt) else "",
+                    "data": "",
+                    "valor": "",
+                    "peso": "",
+                    "cep_origem": "",
+                    "cep_destino": "",
+                    "municipio_origem": "",
+                    "municipio_destino": "",
+                    "nNF": "",
+                    "docnun": "",
+                    "placas": localizar_placas(txt)
+                }
             except:
-                info = {"arquivo":nome,"error":"Extensão não suportada"}
+                info = {"arquivo": nome, "error": "extensão não suportada"}
         info["arquivo"] = nome
         rows.append(info)
     df = pd.DataFrame(rows)
-    expected = ["arquivo","chave_acesso","data","valor","peso","cep_origem","cep_destino","nNF","docnun","placas"]
+    expected = ["arquivo","chave_acesso","data","valor","peso","cep_origem","cep_destino",
+                "municipio_origem","municipio_destino","nNF","docnun","placas"]
     for c in expected:
-        if c not in df.columns: df[c]=""
+        if c not in df.columns:
+            df[c] = ""
     return df[expected]
 
-def salvar_no_banco_local(df, path=DB_PATH):
-    if df is None or df.empty: return
+# ------------------------------
+# Banco SQLite criptografado
+# ------------------------------
+def criar_banco_local(path=DB_PATH):
+    conn = sqlite3.connect(path)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS notas (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        arquivo TEXT,
+        chave_acesso TEXT UNIQUE,
+        data TEXT,
+        valor TEXT,
+        peso TEXT,
+        cep_origem TEXT,
+        cep_destino TEXT,
+        municipio_origem TEXT,
+        municipio_destino TEXT,
+        nNF TEXT,
+        docnun TEXT,
+        placas TEXT,
+        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def salvar_no_banco_local(df, fernet, path=DB_PATH):
+    if df is None or df.empty:
+        return
     conn = sqlite3.connect(path)
     cursor = conn.cursor()
     for _, r in df.iterrows():
         try:
+            valor_encrypted = fernet.encrypt(r.get("valor","").encode()).decode()
+            peso_encrypted = fernet.encrypt(r.get("peso","").encode()).decode()
+            docnun_encrypted = fernet.encrypt(r.get("docnun","").encode()).decode()
+            placas_encrypted = fernet.encrypt(r.get("placas","").encode()).decode()
+            chave_encrypted = fernet.encrypt(r.get("chave_acesso","").encode()).decode()
             cursor.execute("""
-            INSERT INTO notas (arquivo, chave_acesso, data, valor, peso, cep_origem, cep_destino, nNF, docnun, placas)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,(r.get("arquivo",""),r.get("chave_acesso",""),r.get("data",""),r.get("valor",""),r.get("peso",""),
-                r.get("cep_origem",""),r.get("cep_destino",""),r.get("nNF",""),r.get("docnun",""),r.get("placas","")))
+            INSERT INTO notas 
+            (arquivo, chave_acesso, data, valor, peso, cep_origem, cep_destino, 
+             municipio_origem, municipio_destino, nNF, docnun, placas)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r.get("arquivo",""),
+                chave_encrypted,
+                r.get("data",""),
+                valor_encrypted,
+                peso_encrypted,
+                r.get("cep_origem",""),
+                r.get("cep_destino",""),
+                r.get("municipio_origem",""),
+                r.get("municipio_destino",""),
+                r.get("nNF",""),
+                docnun_encrypted,
+                placas_encrypted
+            ))
         except sqlite3.IntegrityError:
             pass
     conn.commit()
     conn.close()
 
-# ===========================
-# Interface Streamlit
-# ===========================
-criar_banco_local()
+# ------------------------------
+# Login/Criptografia
+# ------------------------------
+if "login_attempts" not in st.session_state:
+    st.session_state.login_attempts = 0
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-st.title("📄 Extrator de NF-e — Seguro e Dinâmico")
+senha_input = st.text_input("Senha mestra:", type="password")
 
-# --- Login / cadastro ---
-if "logado" not in st.session_state:
-    st.session_state["logado"] = False
-
-if not st.session_state["logado"]:
-    st.subheader("🔑 Login")
-    username = st.text_input("Usuário")
-    senha = st.text_input("Senha", type="password")
-    # Verificar botão login
-    if st.button("Entrar"):
-        # primeiro acesso: cadastrar
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM usuarios WHERE username=?", (username,))
-        if cursor.fetchone() is None:
-            cadastrar_usuario(username, senha)
-            st.success("Usuário cadastrado e logado!")
-            st.session_state["logado"]=True
+if st.button("Entrar"):
+    st.session_state.login_attempts += 1
+    if st.session_state.login_attempts > MAX_LOGIN_ATTEMPTS:
+        st.error("Máximo de tentativas excedido. Contate o administrador.")
+    else:
+        key_local = carregar_chave_local()
+        if key_local:
+            fernet = Fernet(key_local)
+            st.session_state.fernet = fernet
+            st.session_state.logged_in = True
         else:
-            ok,msg = verificar_login(username, senha)
-            if ok:
-                st.success("Login bem-sucedido!")
-                st.session_state["logado"]=True
-            else:
-                st.error(msg)
-        conn.close()
+            fernet = gerar_chave_aes(senha_input)
+            salvar_chave_local(fernet._signing_key + fernet._encryption_key)
+            st.session_state.fernet = fernet
+            st.session_state.logged_in = True
+        st.success("Login realizado!")
+
+if not st.session_state.logged_in:
     st.stop()
 
-# --- Upload de arquivos ---
+# ------------------------------
+# Interface principal
+# ------------------------------
+st.title("📄 Extrator de NF-e Seguro e Bonito")
+criar_banco_local()
+
 uploaded_files = st.file_uploader("Envie XML/PDF (múltiplos permitidos)", accept_multiple_files=True)
+
 if uploaded_files:
     files_list = [(f.name, f.getvalue()) for f in uploaded_files]
     st.info(f"{len(files_list)} arquivo(s) enviados. Processando...")
     df_novo = processar_arquivos(files_list)
-    st.subheader("📊 Novas notas extraídas")
-    st.dataframe(df_novo)
+    st.subheader("Novas notas extraídas")
+    st.dataframe(df_novo.style.highlight_max(subset=["valor","peso"], color="lightgreen"))
 
-    # carregar histórico local
+    salvar_no_banco_local(df_novo, st.session_state.fernet)
+
+# ------------------------------
+# Exportação CSV descriptografado
+# ------------------------------
+if st.button("Exportar CSV (dados descriptografados)"):
     conn = sqlite3.connect(DB_PATH)
-    try:
-        df_antigo = pd.read_sql_query("SELECT * FROM notas", conn)
-    except:
-        df_antigo = pd.DataFrame(columns=df_novo.columns)
+    df_db = pd.read_sql_query("SELECT * FROM notas ORDER BY criado_em DESC", conn)
     conn.close()
+    fernet = st.session_state.fernet
+    for col in ["chave_acesso","valor","peso","docnun","placas"]:
+        df_db[col] = df_db[col].apply(lambda x: fernet.decrypt(x.encode()).decode() if x else "")
+    csv_bytes = df_db.to_csv(index=False).encode()
+    st.download_button("Baixar CSV", data=csv_bytes, file_name="notas_descriptografadas.csv", mime="text/csv")
 
-    # juntar e deduplicar por chave_acesso
-    if not df_antigo.empty:
-        df_total = pd.concat([df_antigo[df_antigo.columns.intersection(df_novo.columns)], df_novo], ignore_index=True)
-    else:
-        df_total = df_novo.copy()
-    if "chave_acesso" in df_total.columns and df_total["chave_acesso"].notna().any():
-        df_total = df_total.drop_duplicates(subset=["chave_acesso"], keep="last")
+# ------------------------------
+# Estatísticas visuais
+# ------------------------------
+conn = sqlite3.connect(DB_PATH)
+df_hist = pd.read_sql_query("SELECT * FROM notas ORDER BY criado_em DESC LIMIT 200", conn)
+conn.close()
+fernet = st.session_state.fernet
+for col in ["chave_acesso","valor","peso","docnun","placas"]:
+    df_hist[col] = df_hist[col].apply(lambda x: fernet.decrypt(x.encode()).decode() if x else "")
 
-    st.subheader("📈 Histórico consolidado")
-    st.dataframe(df_total)
-
-    # salvar local
-    salvar_no_banco_local(df_novo)
-
-    # botão export CSV
-    csv = df_total.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Exportar histórico CSV", csv, "notas_extradas.csv", "text/csv")
+if not df_hist.empty:
+    total_notas = len(df_hist)
+    total_valor = df_hist["valor"].replace(",", ".", regex=True).astype(float).sum()
+    total_peso = df_hist["peso"].replace(",", ".", regex=True).astype(float).sum()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total de Notas", total_notas)
+    col2.metric("Valor Total (R$)", f"{total_valor:,.2f}")
+    col3.metric("Peso Total (kg)", f"{total_peso:,.2f}")
+    st.subheader("Últimas 200 notas (descriptografadas)")
+    st.dataframe(df_hist.style.highlight_max(subset=["valor","peso"], color="lightblue"))
