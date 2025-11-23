@@ -11,12 +11,12 @@ from google.oauth2.service_account import Credentials
 import gspread
 from datetime import datetime
 
-st.set_page_config(page_title="Extrator de NFe — C.Vale", layout="wide")
+st.set_page_config(page_title="Extrator de NF", layout="wide")
 
 # ------------------------------
 # CONFIGURAÇÕES
 # ------------------------------
-# Coloque aqui o ID da sua planilha (já informado por você)
+# ID da planilha
 SHEET_ID = "132mwn9QnOYOcitfCkr5yJngE7Anr1KRdu_tb0EPFmtI"
 
 # nome da aba (sheet) dentro da planilha
@@ -67,9 +67,8 @@ def extrair_texto_pdf_bytes(bts):
             text = ""
     return text
 
-# ------------------------------
 # Extração de XML e PDF
-# ------------------------------
+
 def extract_from_xml_bytes(bts):
     try:
         root = ET.fromstring(bts)
