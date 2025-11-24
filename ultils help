@@ -1,0 +1,9 @@
+import os
+
+def save_uploaded_file(uploaded_file):
+    folder = "temp_files"
+
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+
+    file_path =
