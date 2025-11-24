@@ -1,358 +1,271 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import re
-import io
-import sqlite3
-import xml.etree.ElementTree as ET
-import pdfplumber
-from datetime import datetime
-from cryptography.fernet import Fernet
-import base64
+# app_streamlit_protected.py
+# Streamlit app with simple password protection using Fernet encryption
+# - Generates a Fernet key (secret.key) if it doesn't exist
+# - Encrypts the provided access password and stores it in password.enc
+# - Authentication screen asks for password and compares with decrypted stored password
+# - Allows upload of CSV/XLSX/XML (NF-e) files
+# - For NF-e XML files it attempts to extract: municipio_origem, municipio_destino, empresa_emissora
+# - Adds columns municipio_origem, municipio_destino, empresa_emissora when missing
+
 import os
+import io
+import base64
+import pandas as pd
+import streamlit as st
+from cryptography.fernet import Fernet
+import xml.etree.ElementTree as ET
+from typing import Optional, Dict, List
 
-# ------------------------------
-# Configuração Streamlit
-# ------------------------------
-st.set_page_config(page_title="Extrator de NF-e Seguro", layout="wide")
+# ---------- Configuration (change paths if needed) ----------
+KEY_FILE = "secret.key"          # file that stores the Fernet key (keep secret, do not commit)
+PASS_FILE = "password.enc"      # file that stores the encrypted password
+# default password requested by user (will be encrypted and saved when first run)
+DEFAULT_PASSWORD = "Codigo20767@"
 
-DB_PATH = "nfe_local_encrypted.db"
-MAX_LOGIN_ATTEMPTS = 5
-AES_KEY_FILE = "aes_key.key"
+# ---------- Helpers for encryption ----------
 
-# ------------------------------
-# Funções de criptografia AES
-# ------------------------------
-def gerar_chave_aes(senha: str):
-    key = base64.urlsafe_b64encode(senha.encode("utf-8").ljust(32)[:32])
-    return Fernet(key)
-
-def salvar_chave_local(key: bytes):
-    with open(AES_KEY_FILE, "wb") as f:
+def generate_and_save_key(path: str = KEY_FILE) -> bytes:
+    key = Fernet.generate_key()
+    with open(path, "wb") as f:
         f.write(key)
+    return key
 
-def carregar_chave_local():
-    if os.path.exists(AES_KEY_FILE):
-        return open(AES_KEY_FILE, "rb").read()
+
+def load_key(path: str = KEY_FILE) -> bytes:
+    if not os.path.exists(path):
+        return generate_and_save_key(path)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def encrypt_password(password: str, key: bytes, path: str = PASS_FILE) -> bytes:
+    f = Fernet(key)
+    token = f.encrypt(password.encode())
+    with open(path, "wb") as f_out:
+        f_out.write(token)
+    return token
+
+
+def decrypt_password(token: bytes, key: bytes) -> str:
+    f = Fernet(key)
+    return f.decrypt(token).decode()
+
+
+def load_encrypted_password(path: str = PASS_FILE) -> Optional[bytes]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+# ---------- Helpers to parse NF-e XMLs (expanded with more fields) (robust to namespaces) ----------
+
+def strip_ns(tag: str) -> str:
+    # removes namespace from an XML tag
+    if '}' in tag:
+        return tag.split('}', 1)[1]
+    return tag
+
+
+def find_text_by_path(root: ET.Element, path: List[str]) -> Optional[str]:
+    # tries to descend by tag names ignoring namespaces
+    # path is a list like ['infNFe','dest','enderDest','xMun']
+    nodes = [root]
+    for p in path:
+        next_nodes = []
+        for node in nodes:
+            for child in node:
+                if strip_ns(child.tag) == p:
+                    next_nodes.append(child)
+        if not next_nodes:
+            return None
+        nodes = next_nodes
+    # return text of first matching node
+    if nodes:
+        return nodes[0].text.strip() if nodes[0].text else None
     return None
 
-# ------------------------------
-# Funções de extração e formatação
-# ------------------------------
-def limpar_chave(texto):
-    if not texto:
-        return ""
-    s = re.sub(r"\D", "", texto)
-    return s if len(s) == 44 else ""
 
-def formatar_valor_br(valor):
+def parse_nfe_xml_bytes(file_bytes: bytes) -> Dict[str, Optional[str]]:
+    # Parse XML and extract municipality origin/dest and issuer company
     try:
-        v = float(str(valor).replace(".", "").replace(",", "."))
-        s = f"{v:,.2f}"
-        return s.replace(",", "X").replace(".", ",").replace("X", ".")
-    except:
-        return "" if pd.isna(valor) else str(valor)
+        tree = ET.fromstring(file_bytes)
+    except Exception:
+        # Additional fields
+    chave_acesso = find_text_by_path(infNFe, ['ide','cNF']) or None
+    valor_total = find_text_by_path(infNFe, ['total','ICMSTot','vNF']) or None
+    cnpj_emitente = find_text_by_path(infNFe, ['emit','CNPJ']) or None
 
-def localizar_placas(texto):
-    if not texto:
-        return ""
-    t = texto.upper()
-    pat = r"[A-Z]{3}[0-9]{4}|[A-Z]{3}[0-9][A-Z][0-9]{2}"
-    achados = re.findall(pat, t)
-    seen = set()
-    placas = []
-    for p in achados:
-        if p not in seen:
-            seen.add(p)
-            placas.append(p)
-    return ", ".join(placas)
+    return {"municipio_origem": None, "municipio_destino": None, "empresa_emissora": None}
 
-def extrair_texto_pdf_bytes(bts):
-    text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(bts)) as pdf:
-            for p in pdf.pages:
-                text += "\n" + (p.extract_text() or "")
-    except:
-        try:
-            text = bts.decode("latin-1", errors="ignore")
-        except:
-            text = ""
-    return text
+    # find infNFe element (some XMLs wrap NFe/NFe or NFe/infNFe)
+    # We'll search for element with tag name infNFe regardless of namespace
+    infNFe = None
+    for elem in tree.iter():
+        if strip_ns(elem.tag) == 'infNFe':
+            infNFe = elem
+            break
+    if infNFe is None:
+        # maybe tree itself is infNFe
+        if strip_ns(tree.tag) == 'infNFe':
+            infNFe = tree
+    if infNFe is None:
+        # fallback to tree
+        infNFe = tree
 
-# ------------------------------
-# Extração XML/PDF
-# ------------------------------
-def extract_from_xml_bytes(bts):
-    try:
-        root = ET.fromstring(bts)
-    except:
-        return {"error": "XML inválido"}
-
-    texto = ET.tostring(root, encoding="utf-8", method="text").decode("utf-8")
-    # Chave de acesso
-    chave = ""
-    for elem in root.iter():
-        tag = elem.tag
-        if tag.lower().endswith("infnfe") and "Id" in elem.attrib:
-            chave = limpar_chave(elem.attrib.get("Id", ""))
-            if chave:
-                break
-    if not chave:
-        m = re.search(r"\d{44}", texto)
-        if m:
-            chave = limpar_chave(m.group(0))
-    # Data
-    data = ""
-    m = re.search(r"\d{4}-\d{2}-\d{2}", texto)
-    if m:
-        data = m.group(0)
-    else:
-        m2 = re.search(r"\d{2}/\d{2}/\d{4}", texto)
-        if m2:
-            try:
-                data = datetime.strptime(m2.group(0), "%d/%m/%Y").date().isoformat()
-            except:
-                data = m2.group(0)
-    # Valor
-    v = ""
-    m = re.search(r"vNF[^0-9]*([\d\.,]+)", texto, flags=re.IGNORECASE)
-    if m:
-        v = formatar_valor_br(m.group(1))
-    else:
-        m2 = re.search(r"R\$[^\d]*([\d\.,]+)", texto)
-        if m2:
-            v = formatar_valor_br(m2.group(1))
-    # Peso
-    p = ""
-    m = re.search(r"(peso[^\d]*)([\d\.,]+)", texto, flags=re.IGNORECASE)
-    if m:
-        p = formatar_valor_br(m.group(2))
-    else:
-        m2 = re.search(r"([\d\.,]+)\s?kg", texto, flags=re.IGNORECASE)
-        if m2:
-            p = formatar_valor_br(m2.group(1))
-    # CEPs
-    ceps = re.findall(r"\d{5}-\d{3}|\d{8}", texto)
-    cep_origem = ceps[0] if len(ceps) > 0 else ""
-    cep_destino = ceps[1] if len(ceps) > 1 else ""
-    # Municípios
-    muns = re.findall(r"(?:Município|xMun)[^\w]*([\w\s]+)", texto)
-    municipio_origem = muns[0] if len(muns) > 0 else ""
-    municipio_destino = muns[1] if len(muns) > 1 else ""
-    # Número NF
-    nNF = ""
-    m = re.search(r"\bnNF\b[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    if m:
-        nNF = m.group(1)
-    # Docnun
-    docnun = ""
-    m = re.search(r"docnun[^0-9]*([0-9]+)", texto, flags=re.IGNORECASE)
-    if m:
-        docnun = m.group(1)
-    # Placas
-    placas = localizar_placas(texto)
+    municipio_dest = find_text_by_path(infNFe, ['dest','enderDest','xMun']) or find_text_by_path(infNFe, ['dest','enderDest','cMun'])
+    municipio_orig = find_text_by_path(infNFe, ['emit','enderEmit','xMun']) or find_text_by_path(infNFe, ['dest','enderDest','xMun'])
+    # issuer name usually in emit/xNome
+    empresa = find_text_by_path(infNFe, ['emit','xNome']) or find_text_by_path(infNFe, ['emit','xFant'])
 
     return {
-        "arquivo": "",
-        "chave_acesso": chave,
-        "data": data,
-        "valor": v,
-        "peso": p,
-        "cep_origem": cep_origem,
-        "cep_destino": cep_destino,
-        "municipio_origem": municipio_origem,
-        "municipio_destino": municipio_destino,
-        "nNF": nNF,
-        "docnun": docnun,
-        "placas": placas
+        "municipio_origem": municipio_orig,
+        "municipio_destino": municipio_dest,
+        "empresa_emissora": empresa,
     }
 
-def extract_from_pdf_bytes(bts):
-    texto = extrair_texto_pdf_bytes(bts)
-    # Reaproveitar função XML para estrutura
-    return extract_from_xml_bytes(texto.encode('utf-8'))
+# ---------- Streamlit UI ----------
 
-# ------------------------------
-# Processamento múltiplos arquivos
-# ------------------------------
-def processar_arquivos(files):
-    rows = []
-    for nome, conteudo in files:
-        ext = nome.lower().split('.')[-1]
-        if ext == "xml":
-            info = extract_from_xml_bytes(conteudo)
-        elif ext == "pdf":
-            info = extract_from_pdf_bytes(conteudo)
-        else:
-            try:
-                txt = conteudo.decode('latin-1', errors='ignore')
-                info = {
-                    "arquivo": nome,
-                    "chave_acesso": limpar_chave(re.search(r"\d{44}", txt).group(0)) if re.search(r"\d{44}", txt) else "",
-                    "data": "",
-                    "valor": "",
-                    "peso": "",
-                    "cep_origem": "",
-                    "cep_destino": "",
-                    "municipio_origem": "",
-                    "municipio_destino": "",
-                    "nNF": "",
-                    "docnun": "",
-                    "placas": localizar_placas(txt)
-                }
-            except:
-                info = {"arquivo": nome, "error": "extensão não suportada"}
-        info["arquivo"] = nome
-        rows.append(info)
-    df = pd.DataFrame(rows)
-    expected = ["arquivo","chave_acesso","data","valor","peso","cep_origem","cep_destino",
-                "municipio_origem","municipio_destino","nNF","docnun","placas"]
-    for c in expected:
-        if c not in df.columns:
-            df[c] = ""
-    return df[expected]
+st.set_page_config(page_title="NF-e - Protegido", layout="wide")
+st.title("Aplicativo NF-e — Acesso Protegido")
 
-# ------------------------------
-# Banco SQLite criptografado
-# ------------------------------
-def criar_banco_local(path=DB_PATH):
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS notas (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        arquivo TEXT,
-        chave_acesso TEXT UNIQUE,
-        data TEXT,
-        valor TEXT,
-        peso TEXT,
-        cep_origem TEXT,
-        cep_destino TEXT,
-        municipio_origem TEXT,
-        municipio_destino TEXT,
-        nNF TEXT,
-        docnun TEXT,
-        placas TEXT,
-        criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-    conn.commit()
-    conn.close()
+# Ensure key exists
+key = load_key()
 
-def salvar_no_banco_local(df, fernet, path=DB_PATH):
-    if df is None or df.empty:
-        return
-    conn = sqlite3.connect(path)
-    cursor = conn.cursor()
-    for _, r in df.iterrows():
+# Ensure encrypted password exists; if not create it from DEFAULT_PASSWORD
+enc_pass = load_encrypted_password()
+if enc_pass is None:
+    enc_pass = encrypt_password(DEFAULT_PASSWORD, key)
+    st.info("Arquivo de senha não encontrado: foi gerado e armazenado localmente.")
+
+# Login
+if 'autenticado' not in st.session_state:
+    st.session_state['autenticado'] = False
+
+if not st.session_state['autenticado']:
+    # ensure new fields exist if missing
+    for c in ['chave_acesso','valor_total','cnpj_emitente']:
+        if c not in df_merged.columns:
+            df_merged[c] = None
+
+    st.subheader("Login")
+    pwd = st.text_input("Senha de acesso", type="password")
+    if st.button("Entrar"):
         try:
-            valor_encrypted = fernet.encrypt(r.get("valor","").encode()).decode()
-            peso_encrypted = fernet.encrypt(r.get("peso","").encode()).decode()
-            docnun_encrypted = fernet.encrypt(r.get("docnun","").encode()).decode()
-            placas_encrypted = fernet.encrypt(r.get("placas","").encode()).decode()
-            chave_encrypted = fernet.encrypt(r.get("chave_acesso","").encode()).decode()
-            cursor.execute("""
-            INSERT INTO notas 
-            (arquivo, chave_acesso, data, valor, peso, cep_origem, cep_destino, 
-             municipio_origem, municipio_destino, nNF, docnun, placas)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                r.get("arquivo",""),
-                chave_encrypted,
-                r.get("data",""),
-                valor_encrypted,
-                peso_encrypted,
-                r.get("cep_origem",""),
-                r.get("cep_destino",""),
-                r.get("municipio_origem",""),
-                r.get("municipio_destino",""),
-                r.get("nNF",""),
-                docnun_encrypted,
-                placas_encrypted
-            ))
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
-
-# ------------------------------
-# Login/Criptografia
-# ------------------------------
-if "login_attempts" not in st.session_state:
-    st.session_state.login_attempts = 0
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-
-senha_input = st.text_input("Senha mestra:", type="password")
-
-if st.button("Entrar"):
-    st.session_state.login_attempts += 1
-    if st.session_state.login_attempts > MAX_LOGIN_ATTEMPTS:
-        st.error("Máximo de tentativas excedido. Contate o administrador.")
-    else:
-        key_local = carregar_chave_local()
-        if key_local:
-            fernet = Fernet(key_local)
-            st.session_state.fernet = fernet
-            st.session_state.logged_in = True
-        else:
-            fernet = gerar_chave_aes(senha_input)
-            salvar_chave_local(fernet._signing_key + fernet._encryption_key)
-            st.session_state.fernet = fernet
-            st.session_state.logged_in = True
-        st.success("Login realizado!")
-
-if not st.session_state.logged_in:
+            stored = load_encrypted_password()
+            if stored is None:
+                st.error("Senha armazenada não encontrada — rode novamente para regenerar.")
+            else:
+                real = decrypt_password(stored, key)
+                if pwd == real:
+                    st.session_state['autenticado'] = True
+                    st.success("Autenticado com sucesso!")
+                else:
+                    st.error("Senha incorreta.")
+        except Exception as e:
+            st.error(f"Erro ao verificar senha: {e}")
     st.stop()
 
-# ------------------------------
-# Interface principal
-# ------------------------------
-st.title("📄 Extrator de NF-e Seguro e Bonito")
-criar_banco_local()
+# If authenticated, show main app
+st.sidebar.success("Usuário autenticado")
 
-uploaded_files = st.file_uploader("Envie XML/PDF (múltiplos permitidos)", accept_multiple_files=True)
+st.header("Upload e processamento de arquivos")
+st.write("Faça upload de arquivos CSV, XLSX ou arquivos NF-e em XML. O app tentará extrair município origem/destino e empresa emissora.")
+
+uploaded_files = st.file_uploader("Carregar arquivos (pode selecionar múltiplos)", accept_multiple_files=True, type=['csv','xlsx','xls','xml'])
+
+all_dfs = []
+xml_records = []
 
 if uploaded_files:
-    files_list = [(f.name, f.getvalue()) for f in uploaded_files]
-    st.info(f"{len(files_list)} arquivo(s) enviados. Processando...")
-    df_novo = processar_arquivos(files_list)
-    st.subheader("Novas notas extraídas")
-    st.dataframe(df_novo.style.highlight_max(subset=["valor","peso"], color="lightgreen"))
+    for uploaded in uploaded_files:
+        name = uploaded.name
+        try:
+            data = uploaded.read()
+            if name.lower().endswith('.xml'):
+                rec = parse_nfe_xml_bytes(data)
+                # create a one-row dataframe with extracted fields
+                df_xml = pd.DataFrame([rec])
+                df_xml['source_file'] = name
+                xml_records.append(df_xml)
+            elif name.lower().endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(data))
+                df['source_file'] = name
+                all_dfs.append(df)
+            elif name.lower().endswith(('.xls','xlsx')):
+                df = pd.read_excel(io.BytesIO(data))
+                df['source_file'] = name
+                all_dfs.append(df)
+            else:
+                st.warning(f"Formato não suportado: {name}")
+        except Exception as e:
+            st.error(f"Erro ao processar {name}: {e}")
 
-    salvar_no_banco_local(df_novo, st.session_state.fernet)
+    # concat all tabular files and xml-derived records
+    if all_dfs:
+        df_total = pd.concat(all_dfs, ignore_index=True)
+    else:
+        df_total = pd.DataFrame()
 
-# ------------------------------
-# Exportação CSV descriptografado
-# ------------------------------
-if st.button("Exportar CSV (dados descriptografados)"):
-    conn = sqlite3.connect(DB_PATH)
-    df_db = pd.read_sql_query("SELECT * FROM notas ORDER BY criado_em DESC", conn)
-    conn.close()
-    fernet = st.session_state.fernet
-    for col in ["chave_acesso","valor","peso","docnun","placas"]:
-        df_db[col] = df_db[col].apply(lambda x: fernet.decrypt(x.encode()).decode() if x else "")
-    csv_bytes = df_db.to_csv(index=False).encode()
-    st.download_button("Baixar CSV", data=csv_bytes, file_name="notas_descriptografadas.csv", mime="text/csv")
+    if xml_records:
+        df_xml_all = pd.concat(xml_records, ignore_index=True)
+    else:
+        df_xml_all = pd.DataFrame()
 
-# ------------------------------
-# Estatísticas visuais
-# ------------------------------
-conn = sqlite3.connect(DB_PATH)
-df_hist = pd.read_sql_query("SELECT * FROM notas ORDER BY criado_em DESC LIMIT 200", conn)
-conn.close()
-fernet = st.session_state.fernet
-for col in ["chave_acesso","valor","peso","docnun","placas"]:
-    df_hist[col] = df_hist[col].apply(lambda x: fernet.decrypt(x.encode()).decode() if x else "")
+    # merge xml info to tabular data when possible by source_file
+    if not df_total.empty and not df_xml_all.empty:
+        # try join on source_file if present
+        if 'source_file' in df_total.columns and 'source_file' in df_xml_all.columns:
+            df_merged = df_total.merge(df_xml_all, on='source_file', how='left')
+        else:
+            df_merged = df_total.copy()
+            # append columns from xml
+            for c in ['municipio_origem','municipio_destino','empresa_emissora']:
+                if c not in df_merged.columns:
+                    df_merged[c] = None
+    elif not df_total.empty:
+        df_merged = df_total.copy()
+    elif not df_xml_all.empty:
+        # only xmls
+        df_merged = df_xml_all.copy()
+    else:
+        df_merged = pd.DataFrame()
 
-if not df_hist.empty:
-    total_notas = len(df_hist)
-    total_valor = df_hist["valor"].replace(",", ".", regex=True).astype(float).sum()
-    total_peso = df_hist["peso"].replace(",", ".", regex=True).astype(float).sum()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total de Notas", total_notas)
-    col2.metric("Valor Total (R$)", f"{total_valor:,.2f}")
-    col3.metric("Peso Total (kg)", f"{total_peso:,.2f}")
-    st.subheader("Últimas 200 notas (descriptografadas)")
-    st.dataframe(df_hist.style.highlight_max(subset=["valor","peso"], color="lightblue"))
+    # Ensure the three columns exist
+    for c in ['municipio_origem','municipio_destino','empresa_emissora']:
+        if c not in df_merged.columns:
+            df_merged[c] = None
+
+    st.subheader("Preview dos dados processados")
+    st.dataframe(df_merged.head(200))
+
+    # Give user the option to download processed CSV
+    if not df_merged.empty:
+        csv = df_merged.to_csv(index=False).encode('utf-8')
+        b64 = base64.b64encode(csv).decode()
+        href = f"data:file/csv;base64,{b64}"
+        st.markdown(f"[Baixar CSV processado]({href})")
+
+    # Save processed file locally if user wants
+    if st.button("Salvar arquivo processado em 'processed_output.csv'"):
+        try:
+            df_merged.to_csv('processed_output.csv', index=False)
+            st.success("Salvo como processed_output.csv")
+        except Exception as e:
+            st.error(f"Erro ao salvar arquivo: {e}")
+
+# ---------- Administração: regenerar chave / senha (opcional) ----------
+st.sidebar.header("Admin")
+if st.sidebar.button("Regenerar chave Fernet (gera nova secret.key)"):
+    key = generate_and_save_key()
+    st.sidebar.success("Nova chave gerada. ATENÇÃO: senhas já criptografadas com a chave antiga NÃO serão mais descriptografáveis.")
+
+if st.sidebar.button("Atualizar senha armazenada para Codigo20767@"):
+    try:
+        encrypt_password(DEFAULT_PASSWORD, key)
+        st.sidebar.success("Senha atualizada e armazenada criptografada.")
+    except Exception as e:
+        st.sidebar.error(f"Erro ao armazenar senha: {e}")
+
+st.sidebar.markdown("**Segurança:** não comite 'secret.key' ou 'password.enc' no repositório. Use variáveis de ambiente ou serviços de segredo para produção.")
+
+# End of file
