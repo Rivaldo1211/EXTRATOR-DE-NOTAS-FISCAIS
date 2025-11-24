@@ -64,27 +64,46 @@ def carregar_todas_notas():
 # ==============================
 # EXTRAÇÃO XML
 # ==============================
+def get_field(element, cast_float=False):
+    if element is not None and element.text is not None:
+        text = element.text
+        if cast_float:
+            try:
+                return float(text.replace(",", "."))
+            except Exception:
+                return 0.0
+        return text
+    return "" if not cast_float else 0.0
+
 def ler_xml(conteudo):
     try:
+        # Garante que o conteúdo esteja em string (decodifica caso seja bytes)
+        if isinstance(conteudo, bytes):
+            conteudo = conteudo.decode("utf-8")
+
         root = ET.fromstring(conteudo)
 
         ns = {"ns": "http://www.portalfiscal.inf.br/nfe"}
 
-        chave = root.find(".//ns:infNFe", ns).attrib.get("Id", "")[3:]
-        data = root.find(".//ns:dhEmi", ns).text
-        valor = root.find(".//ns:vNF", ns).text
-        peso = root.find(".//ns:pesoB", ns).text if root.find(".//ns:pesoB", ns) is not None else "0"
-        origem = root.find(".//ns:enderEmit/ns:CEP", ns).text
-        destino = root.find(".//ns:enderDest/ns:CEP", ns).text
-        nNF = root.find(".//ns:ide/ns:nNF", ns).text
-        docnum = root.find(".//ns:ide/ns:cNF", ns).text
-        placa = root.find(".//ns:veicTransp/ns:placa", ns).text
+        infNFe = root.find(".//ns:infNFe", ns)
+        chave = ""
+        if infNFe is not None:
+            chave = infNFe.attrib.get("Id", "")[3:]
+
+        data = get_field(root.find(".//ns:dhEmi", ns))
+        valor = get_field(root.find(".//ns:vNF", ns), cast_float=True)
+        peso = get_field(root.find(".//ns:pesoB", ns), cast_float=True)
+        origem = get_field(root.find(".//ns:enderEmit/ns:CEP", ns))
+        destino = get_field(root.find(".//ns:enderDest/ns:CEP", ns))
+        nNF = get_field(root.find(".//ns:ide/ns:nNF", ns))
+        docnum = get_field(root.find(".//ns:ide/ns:cNF", ns))
+        placa = get_field(root.find(".//ns:veicTransp/ns:placa", ns))
 
         return {
             "chave_acesso": chave,
             "data": data,
-            "valor": float(valor.replace(",", ".")),
-            "peso": float(peso.replace(",", ".")),
+            "valor": valor,
+            "peso": peso,
             "cep_origem": origem,
             "cep_destino": destino,
             "nNF": nNF,
@@ -92,7 +111,8 @@ def ler_xml(conteudo):
             "placa": placa
         }
 
-    except:
+    except Exception as e:
+        st.error(f"Erro ao extrair campos do XML: {e}")
         return None
 
 # ==============================
@@ -110,13 +130,17 @@ dados_extraidos = []
 if uploaded_files:
     for file in uploaded_files:
         nome = file.name
-        if nome.endswith(".xml"):
+        if nome.lower().endswith(".xml"):
             conteudo = file.read()
+            # Decodificação agora realizada na função ler_xml
             resultado = ler_xml(conteudo)
 
             if resultado:
                 resultado["arquivo"] = nome
                 dados_extraidos.append(resultado)
+        elif nome.lower().endswith(".pdf"):
+            # Se quiser extrair do PDF, implemente aqui
+            pass
 
 if dados_extraidos:
     df = pd.DataFrame(dados_extraidos)
