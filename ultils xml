@@ -1,17 +1,1 @@
-import xml.etree.ElementTree as ET
-
-def extract_data_from_xml(xml_path):
-    try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
-
-        data = {}
-
-        # Pega todos os campos do XML
-        for element in root.iter():
-            data[element.tag] = element.text
-
-        return data
-
-    except Exception as e:
-        return {"erro": str(e)}
+.
